@@ -52,8 +52,10 @@ def stat_get(key, default="0"):
     return row[0] if row else default
 
 def stat_set(key, value):
-    c.execute("INSERT INTO stats(key,value) VALUES (%s,%s) ON CONFLICT(key) DO UPDATE SET value=%s",
-              (str(key), str(value), str(value)))
+    c.execute(
+        "INSERT INTO stats(key,value) VALUES (%s,%s) ON CONFLICT(key) DO UPDATE SET value=%s",
+        (str(key), str(value), str(value))
+    )
 
 if stat_get("total_users", None) is None:
     stat_set("total_users", "0")
@@ -83,10 +85,7 @@ def rebuild_embeddings():
     global all_chunks, all_embeddings
     c.execute("SELECT text FROM chunks ORDER BY id")
     all_chunks = [r[0] for r in c.fetchall()]
-    if all_chunks:
-        all_embeddings = embed_model.encode(all_chunks, convert_to_tensor=True)
-    else:
-        all_embeddings = []
+    all_embeddings = embed_model.encode(all_chunks, convert_to_tensor=True) if all_chunks else []
 
 # ---------------------------
 # UTILITIES
@@ -101,8 +100,7 @@ def next_batch_id():
 
 def chunk_text(text, max_chars=700):
     words = text.split()
-    chunks = []
-    buf, cur = [], 0
+    chunks, buf, cur = [], [], 0
     for w in words:
         if cur + len(w) + 1 > max_chars:
             chunks.append(" ".join(buf))
@@ -118,8 +116,7 @@ def extract_text_from_pdf(path):
     if not PdfReader:
         raise RuntimeError("PyPDF2 not installed")
     reader = PdfReader(path)
-    texts = [p.extract_text() or "" for p in reader.pages]
-    return "\n".join(texts)
+    return "\n".join([p.extract_text() or "" for p in reader.pages])
 
 def extract_text_from_docx(path):
     if not docx:
@@ -162,7 +159,19 @@ def semantic_answer(query, top_k=5):
         return "I couldn’t find anything relevant in my knowledge base."
 
     context = "\n".join(selected)
-    prompt = f"Answer naturally and directly using the context below:\n\nContext:\n{context}\n\nQuestion:\n{query}\n\nAnswer:"
+    prompt = f"""
+You are JusticeAI, a helpful and friendly assistant.
+Answer naturally and directly in a conversational style using the context below. 
+Do not repeat the question.
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:
+"""
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=300)
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -225,8 +234,7 @@ def start_cmd(msg):
     if str(cid) not in seen:
         seen[str(cid)] = now_str()
         stat_set("seen_users", json.dumps(seen))
-        total = int(stat_get("total_users", "0")) + 1
-        stat_set("total_users", str(total))
+        stat_set("total_users", str(int(stat_get("total_users", "0")) + 1))
     bot.send_message(cid, "👋 Hello! I’m JusticeAI, your upgraded offline AI assistant. Ask me anything!")
 
 @bot.message_handler(commands=['dashboard'])
@@ -242,10 +250,7 @@ def forget_last(msg):
         bot.send_message(msg.chat.id, "❌ Unauthorized.")
         return
     deleted_batch = delete_last_batch()
-    if not deleted_batch:
-        bot.send_message(msg.chat.id, "⚠️ No previous uploads found.")
-        return
-    bot.send_message(msg.chat.id, f"🧹 Deleted last uploaded script (batch {deleted_batch}). Knowledge base updated.")
+    bot.send_message(msg.chat.id, f"🧹 Deleted last uploaded script (batch {deleted_batch}). Knowledge base updated." if deleted_batch else "⚠️ No previous uploads found.")
 
 @bot.message_handler(func=lambda m: True, content_types=['text','document'])
 def all_msgs(msg):
@@ -253,6 +258,7 @@ def all_msgs(msg):
         cid = msg.chat.id
         text = (msg.text or "").strip()
 
+        # Live support
         if any(k in text.lower() for k in ["connect me to live support", "talk to human", "support"]):
             bot.send_message(cid, f"🔗 Connect to support: {LIVE_SUPPORT_LINK}")
             bot.send_message(cid, "Say 'continue' or wait 2 minutes to return to AI.")
@@ -269,6 +275,7 @@ def all_msgs(msg):
             bot.send_message(cid, "🕒 You are with live support. Say 'continue' to talk to AI again.")
             return
 
+        # Admin commands
         if cid == ADMIN_ID:
             txt_lower = text.lower()
             if txt_lower == "🩺 bot health":
@@ -289,11 +296,13 @@ def all_msgs(msg):
                 bot.send_message(cid, f"📊 Stats:\nUsers: {total_users}\nQueries: {total_queries}\nLast 5:\n{txt}")
                 return
 
+        # Process admin upload text
         if cid in admin_waiting_for_upload and msg.content_type == 'text':
             admin_waiting_for_upload.discard(cid)
             threading.Thread(target=process_text, args=(msg.text,cid), daemon=True).start()
             return
 
+        # Process admin upload file
         if cid == ADMIN_ID and msg.content_type == 'document' and cid in admin_waiting_for_upload:
             admin_waiting_for_upload.discard(cid)
             file_info = bot.get_file(msg.document.file_id)
@@ -304,8 +313,8 @@ def all_msgs(msg):
             threading.Thread(target=process_file, args=(path,cid), daemon=True).start()
             return
 
-        total_queries = int(stat_get("total_queries","0"))+1
-        stat_set("total_queries",str(total_queries))
+        # Regular queries
+        stat_set("total_queries", str(int(stat_get("total_queries","0")) + 1))
         ans = semantic_answer(msg.text)
         bot.send_message(cid, ans)
 
