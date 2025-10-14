@@ -2,3 +2,10 @@ pyTelegramBotAPI
 scikit-learn
 PyPDF2
 python-docx
+Flask
+pyTelegramBotAPI
+psycopg2-binary
+scikit-learn
+PyPDF2
+python-docx
+gunicorn
