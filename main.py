@@ -52,7 +52,11 @@ def stat_get(key, default="0"):
     return row[0] if row else default
 
 def stat_set(key, value):
-    c.execute("INSERT INTO stats(key,value) VALUES (%s,%s) ON CONFLICT(key) DO UPDATE SET value=%s", (key, str(value), str(value)))
+    c.execute(
+        "INSERT INTO stats(key,value) VALUES (%s,%s) "
+        "ON CONFLICT(key) DO UPDATE SET value=%s",
+        (key, str(value), str(value))
+    )
 
 if stat_get("total_users", None) is None:
     stat_set("total_users", "0")
@@ -70,8 +74,8 @@ admin_waiting_for_upload = set()
 # ---------------------------
 # EMBEDDINGS & GENERATIVE MODEL
 # ---------------------------
-embed_model = SentenceTransformer('all-MiniLM-L6-v2')  # small and fast
-gen_model_name = "mosaicml/mpt-7b-instruct"  # replaceable
+embed_model = SentenceTransformer('all-MiniLM-L6-v2')  # fast embeddings
+gen_model_name = "mosaicml/mpt-7b-instruct"
 tokenizer = AutoTokenizer.from_pretrained(gen_model_name)
 model = AutoModelForCausalLM.from_pretrained(gen_model_name, device_map="auto", torch_dtype=torch.float16)
 
@@ -100,8 +104,7 @@ def next_batch_id():
 
 def chunk_text(text, max_chars=700):
     words = text.split()
-    chunks = []
-    buf, cur = [], 0
+    chunks, buf, cur = [], [], 0
     for w in words:
         if cur + len(w) + 1 > max_chars:
             chunks.append(" ".join(buf))
@@ -117,8 +120,7 @@ def extract_text_from_pdf(path):
     if not PdfReader:
         raise RuntimeError("PyPDF2 not installed")
     reader = PdfReader(path)
-    texts = [p.extract_text() or "" for p in reader.pages]
-    return "\n".join(texts)
+    return "\n".join(p.extract_text() or "" for p in reader.pages)
 
 def extract_text_from_docx(path):
     if not docx:
@@ -150,7 +152,7 @@ def delete_last_batch():
 # ---------------------------
 def semantic_answer(query, top_k=5):
     if not all_chunks:
-        return "I don’t have any knowledge yet. Ask the admin to upload a script."
+        return "I don’t have any knowledge yet. Ask the admin to upload content."
 
     q_embedding = embed_model.encode([query], convert_to_tensor=True)
     sims = cosine_similarity(q_embedding.cpu().numpy(), all_embeddings.cpu().numpy())[0]
@@ -161,11 +163,10 @@ def semantic_answer(query, top_k=5):
         return "I couldn’t find anything relevant in my knowledge base."
 
     context = "\n".join(selected)
-    prompt = f"Answer this question in detail based on the context:\n\nContext:\n{context}\n\nQuestion:\n{query}\n\nAnswer:"
+    prompt = f"Answer this question naturally based on the context:\n\nContext:\n{context}\n\nQuestion:\n{query}\n\nAnswer:"
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=300)
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 # ---------------------------
 # ADMIN DASHBOARD
@@ -209,7 +210,7 @@ def process_text(text, cid):
     try:
         chunks = chunk_text(text)
         batch = append_chunks_to_db(chunks)
-        bot.send_message(cid, f"✅ Added {len(chunks)} new chunks (batch {batch}). Memory expanded successfully.")
+        bot.send_message(cid, f"✅ Added {len(chunks)} new chunks (batch {batch}). Knowledge updated successfully.")
     except Exception as e:
         traceback.print_exc()
         bot.send_message(cid, f"Error updating knowledge: {e}")
