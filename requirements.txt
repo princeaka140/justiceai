@@ -9,3 +9,11 @@ scikit-learn
 PyPDF2
 python-docx
 gunicorn
+sentence-transformers
+transformers
+torch
+psycopg2-binary
+PyPDF2
+python-docx
+scikit-learn
+telebot
