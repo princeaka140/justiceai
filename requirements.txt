@@ -1,19 +1,26 @@
-pyTelegramBotAPI
-scikit-learn
-PyPDF2
-python-docx
-Flask
-pyTelegramBotAPI
-psycopg2-binary
-scikit-learn
-PyPDF2
-python-docx
-gunicorn
-sentence-transformers
-transformers
-torch
-psycopg2-binary
-PyPDF2
-python-docx
-scikit-learn
-telebot
+# Telegram
+pyTelegramBotAPI==4.29.1
+telebot==0.0.5
+
+# Database
+psycopg2-binary==2.9.11
+
+# NLP & ML
+sentence-transformers==2.2.2
+scikit-learn==1.7.2
+transformers==4.57.1
+torch==2.8.0
+safetensors==0.6.2
+
+# PDF/DOCX parsing
+PyPDF2==3.0.1
+python-docx==1.2.0
+
+# Web server (if deploying on Render/Heroku)
+Flask==3.0.0
+gunicorn==21.2.0
+
+# Utilities
+tqdm==4.67.1
+regex==2025.9.18
+requests==2.32.5
