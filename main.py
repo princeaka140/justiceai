@@ -39,8 +39,16 @@ admin_waiting_for_upload = set()
 # ---------------------------
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS chunks (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, batch_id INTEGER, added_at TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT,
+    batch_id INTEGER,
+    added_at TEXT
+)''')
+c.execute('''CREATE TABLE IF NOT EXISTS stats (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)''')
 conn.commit()
 
 def stat_get(key, default="0"):
@@ -76,9 +84,9 @@ def chunk_text(text, max_chars=700):
         if cur + len(w) + 1 > max_chars:
             chunks.append(" ".join(buf))
             buf = buf[-20:]
-            cur = sum(len(x)+1 for x in buf)
+            cur = sum(len(x) + 1 for x in buf)
         buf.append(w)
-        cur += len(w)+1
+        cur += len(w) + 1
     if buf:
         chunks.append(" ".join(buf))
     return chunks
@@ -133,6 +141,9 @@ def rebuild_vector_index():
     vectorizer = TfidfVectorizer(stop_words="english")
     tfidf_matrix = vectorizer.fit_transform(all_chunks)
 
+# ---------------------------
+# SEMANTIC REASONING
+# ---------------------------
 def semantic_answer(query):
     global vectorizer, tfidf_matrix, all_chunks
     if not vectorizer or not tfidf_matrix:
@@ -140,6 +151,7 @@ def semantic_answer(query):
     if not vectorizer or not all_chunks:
         return "I don’t have any knowledge yet. Ask the admin to upload a script."
 
+    # Find top semantically related chunks
     q_vec = vectorizer.transform([query])
     sims = cosine_similarity(q_vec, tfidf_matrix)[0]
     top_idx = sims.argsort()[-5:][::-1]
@@ -148,18 +160,36 @@ def semantic_answer(query):
     if not selected:
         return "I couldn’t find anything relevant in my knowledge base."
 
+    # Merge best chunks
     context = "\n".join(selected)
-    return generate_wise_reply(context, query)
-
-def generate_wise_reply(context, query):
     summary = summarize(context, query)
-    reasoning = (f"🤔 Based on everything I’ve learned, here’s what best answers your question:\n\n{summary}\n\n💡 In essence, about '{query}', the key point is that {extract_key_point(summary)}")
+
+    reasoning = (
+        f"🤔 Based on everything I’ve learned, here’s what best answers your question:\n\n"
+        f"{summary}\n\n"
+        f"💡 In essence, about '{query}', the key point is that {extract_key_point(summary)}"
+    )
     return reasoning
 
 def summarize(context, query):
-    sentences = context.split(".")
-    matches = [s.strip() for s in sentences if any(w in s.lower() for w in query.lower().split())]
-    summary = ". ".join(matches[:4]) or ". ".join(sentences[:3])
+    # Split context into sentences
+    sentences = [s.strip() for s in context.split(".") if s.strip()]
+    if not sentences:
+        return "I couldn’t summarize anything relevant."
+
+    # TF-IDF for semantic similarity
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf = vectorizer.fit_transform(sentences + [query])
+    sims = cosine_similarity(tfidf[-1], tfidf[:-1])[0]
+
+    # Select top 5 relevant sentences
+    top_idxs = sims.argsort()[-5:][::-1]
+    top_sentences = [sentences[i] for i in top_idxs if sims[i] > 0.05]
+
+    if not top_sentences:
+        top_sentences = sentences[:3]
+
+    summary = ". ".join(top_sentences)
     return summary.strip()
 
 def extract_key_point(text):
@@ -211,12 +241,13 @@ def forget_last(msg):
     rebuild_vector_index()
     bot.send_message(msg.chat.id, f"🧹 Deleted last uploaded script (batch {deleted_batch}). Knowledge base updated.")
 
-@bot.message_handler(func=lambda m: True, content_types=['text','document'])
+@bot.message_handler(func=lambda m: True, content_types=['text', 'document'])
 def all_msgs(msg):
     try:
         cid = msg.chat.id
         text = (msg.text or "").strip().lower()
 
+        # Live support logic
         if any(k in text for k in ["connect me to live support", "talk to human", "support"]):
             bot.send_message(cid, f"🔗 Connect to support: {LIVE_SUPPORT_LINK}")
             bot.send_message(cid, "Say 'continue' or wait 2 minutes to return to AI.")
@@ -233,9 +264,10 @@ def all_msgs(msg):
             bot.send_message(cid, "🕒 You are with live support. Say 'continue' to talk to AI again.")
             return
 
+        # Admin actions
         if cid == ADMIN_ID and msg.text:
             if text == "🩺 bot health":
-                uptime = int(time.time()-START_TIME)
+                uptime = int(time.time() - START_TIME)
                 reply = f"🩺 Uptime: {uptime}s\nUsers: {stat_get('total_users')}\nQueries: {stat_get('total_queries')}\nKnowledge items: {len(get_all_chunks())}\nTime: {now_str()}"
                 bot.send_message(cid, reply)
                 return
@@ -246,15 +278,16 @@ def all_msgs(msg):
             if text == "📊 stats":
                 total_users = stat_get("total_users")
                 total_queries = stat_get("total_queries")
-                seen = json.loads(stat_get("seen_users","{}"))
+                seen = json.loads(stat_get("seen_users", "{}"))
                 last5 = list(seen.items())[-5:]
-                txt = "\n".join([f"{u} @ {t}" for u,t in last5])
+                txt = "\n".join([f"{u} @ {t}" for u, t in last5])
                 bot.send_message(cid, f"📊 Stats:\nUsers: {total_users}\nQueries: {total_queries}\nLast 5:\n{txt}")
                 return
 
+        # Knowledge upload
         if cid in admin_waiting_for_upload and msg.content_type == 'text':
             admin_waiting_for_upload.discard(cid)
-            threading.Thread(target=process_text, args=(msg.text,cid), daemon=True).start()
+            threading.Thread(target=process_text, args=(msg.text, cid), daemon=True).start()
             return
 
         if cid == ADMIN_ID and msg.content_type == 'document' and cid in admin_waiting_for_upload:
@@ -263,15 +296,16 @@ def all_msgs(msg):
             data = bot.download_file(file_info.file_path)
             fname = msg.document.file_name
             path = f"tmp_{int(time.time())}_{fname}"
-            open(path,"wb").write(data)
-            threading.Thread(target=process_file, args=(path,cid), daemon=True).start()
+            open(path, "wb").write(data)
+            threading.Thread(target=process_file, args=(path, cid), daemon=True).start()
             return
 
-        total_queries = int(stat_get("total_queries","0"))+1
-        stat_set("total_queries",str(total_queries))
+        # AI query response
+        total_queries = int(stat_get("total_queries", "0")) + 1
+        stat_set("total_queries", str(total_queries))
         ans = semantic_answer(msg.text)
         bot.send_message(cid, ans)
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
         bot.send_message(msg.chat.id, "⚠️ Error processing your message.")
 
@@ -291,14 +325,16 @@ def process_file(path, cid):
         elif path.lower().endswith(".docx"):
             text = extract_text_from_docx(path)
         else:
-            text = open(path,"r",encoding="utf-8",errors="ignore").read()
+            text = open(path, "r", encoding="utf-8", errors="ignore").read()
         process_text(text, cid)
     except Exception as e:
         traceback.print_exc()
         bot.send_message(cid, f"Error reading file: {e}")
     finally:
-        try: os.remove(path)
-        except: pass
+        try:
+            os.remove(path)
+        except:
+            pass
 
 def process_text(text, cid):
     try:
