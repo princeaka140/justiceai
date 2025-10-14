@@ -39,6 +39,7 @@ conn = psycopg2.connect(DB_URL)
 conn.autocommit = True
 c = conn.cursor()
 
+# Tables
 c.execute('''CREATE TABLE IF NOT EXISTS chunks (
     id SERIAL PRIMARY KEY, text TEXT, batch_id INTEGER, added_at TIMESTAMP DEFAULT now()
 )''')
@@ -57,6 +58,7 @@ def stat_set(key, value):
         (str(key), str(value), str(value))
     )
 
+# Initialize stats
 if stat_get("total_users", None) is None:
     stat_set("total_users", "0")
 if stat_get("total_queries", None) is None:
@@ -76,7 +78,9 @@ admin_waiting_for_upload = set()
 embed_model = SentenceTransformer('all-MiniLM-L6-v2')
 gen_model_name = "mosaicml/mpt-7b-instruct"
 tokenizer = AutoTokenizer.from_pretrained(gen_model_name)
-model = AutoModelForCausalLM.from_pretrained(gen_model_name, device_map="auto", torch_dtype=torch.float16)
+model = AutoModelForCausalLM.from_pretrained(
+    gen_model_name, device_map="auto", torch_dtype=torch.float16
+)
 
 all_chunks = []
 all_embeddings = []
@@ -85,7 +89,10 @@ def rebuild_embeddings():
     global all_chunks, all_embeddings
     c.execute("SELECT text FROM chunks ORDER BY id")
     all_chunks = [r[0] for r in c.fetchall()]
-    all_embeddings = embed_model.encode(all_chunks, convert_to_tensor=True) if all_chunks else []
+    if all_chunks:
+        all_embeddings = embed_model.encode(all_chunks, convert_to_tensor=True)
+    else:
+        all_embeddings = []
 
 # ---------------------------
 # UTILITIES
@@ -100,7 +107,8 @@ def next_batch_id():
 
 def chunk_text(text, max_chars=700):
     words = text.split()
-    chunks, buf, cur = [], [], 0
+    chunks = []
+    buf, cur = [], 0
     for w in words:
         if cur + len(w) + 1 > max_chars:
             chunks.append(" ".join(buf))
@@ -116,7 +124,8 @@ def extract_text_from_pdf(path):
     if not PdfReader:
         raise RuntimeError("PyPDF2 not installed")
     reader = PdfReader(path)
-    return "\n".join([p.extract_text() or "" for p in reader.pages])
+    texts = [p.extract_text() or "" for p in reader.pages]
+    return "\n".join(texts)
 
 def extract_text_from_docx(path):
     if not docx:
@@ -127,6 +136,15 @@ def extract_text_from_docx(path):
 # ---------------------------
 # KNOWLEDGE BASE MANAGEMENT
 # ---------------------------
+def parse_dialogue_format(text):
+    """Extract only Bot responses from User/Bot dialogue."""
+    lines = text.splitlines()
+    responses = []
+    for line in lines:
+        if line.lower().startswith("bot:"):
+            responses.append(line.split(":", 1)[1].strip())
+    return responses
+
 def append_chunks_to_db(chunks):
     batch = next_batch_id()
     for t in chunks:
@@ -159,10 +177,7 @@ def semantic_answer(query, top_k=5):
         return "I couldn’t find anything relevant in my knowledge base."
 
     context = "\n".join(selected)
-    prompt = f"""
-You are JusticeAI, a helpful and friendly assistant.
-Answer naturally and directly in a conversational style using the context below. 
-Do not repeat the question.
+    prompt = f"""Answer naturally and directly using the context below. Do not include any "User:" or "Bot:" labels.
 
 Context:
 {context}
@@ -170,8 +185,7 @@ Context:
 Question:
 {query}
 
-Answer:
-"""
+Answer:"""
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     outputs = model.generate(**inputs, max_new_tokens=300)
     answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -217,7 +231,14 @@ def process_file(path, cid):
 
 def process_text(text, cid):
     try:
-        chunks = chunk_text(text)
+        # Parse Bot responses from User/Bot dialogue
+        bot_responses = parse_dialogue_format(text)
+        if not bot_responses:
+            bot.send_message(cid, "⚠️ No valid Bot responses found in the file/text.")
+            return
+        chunks = []
+        for r in bot_responses:
+            chunks.extend(chunk_text(r))
         batch = append_chunks_to_db(chunks)
         bot.send_message(cid, f"✅ Added {len(chunks)} new chunks (batch {batch}). Memory expanded successfully.")
     except Exception as e:
@@ -234,8 +255,9 @@ def start_cmd(msg):
     if str(cid) not in seen:
         seen[str(cid)] = now_str()
         stat_set("seen_users", json.dumps(seen))
-        stat_set("total_users", str(int(stat_get("total_users", "0")) + 1))
-    bot.send_message(cid, "👋 Hello! I’m JusticeAI, your upgraded offline AI assistant. Ask me anything!")
+        total = int(stat_get("total_users", "0")) + 1
+        stat_set("total_users", str(total))
+    bot.send_message(cid, "👋 Hello! I’m JusticeAI, your upgraded AI assistant. Ask me anything!")
 
 @bot.message_handler(commands=['dashboard'])
 def dashboard(msg):
@@ -250,7 +272,10 @@ def forget_last(msg):
         bot.send_message(msg.chat.id, "❌ Unauthorized.")
         return
     deleted_batch = delete_last_batch()
-    bot.send_message(msg.chat.id, f"🧹 Deleted last uploaded script (batch {deleted_batch}). Knowledge base updated." if deleted_batch else "⚠️ No previous uploads found.")
+    if not deleted_batch:
+        bot.send_message(msg.chat.id, "⚠️ No previous uploads found.")
+        return
+    bot.send_message(msg.chat.id, f"🧹 Deleted last uploaded script (batch {deleted_batch}). Knowledge base updated.")
 
 @bot.message_handler(func=lambda m: True, content_types=['text','document'])
 def all_msgs(msg):
@@ -285,7 +310,7 @@ def all_msgs(msg):
                 return
             if txt_lower == "📘 update knowledge":
                 admin_waiting_for_upload.add(cid)
-                bot.send_message(cid, "📄 Send a .txt/.pdf/.docx file or paste text to add new knowledge.")
+                bot.send_message(cid, "📄 Send a .txt/.pdf/.docx file or paste dialogue text to add new knowledge.")
                 return
             if txt_lower == "📊 stats":
                 total_users = stat_get("total_users")
@@ -296,13 +321,13 @@ def all_msgs(msg):
                 bot.send_message(cid, f"📊 Stats:\nUsers: {total_users}\nQueries: {total_queries}\nLast 5:\n{txt}")
                 return
 
-        # Process admin upload text
+        # Process knowledge upload via text
         if cid in admin_waiting_for_upload and msg.content_type == 'text':
             admin_waiting_for_upload.discard(cid)
             threading.Thread(target=process_text, args=(msg.text,cid), daemon=True).start()
             return
 
-        # Process admin upload file
+        # Process knowledge upload via file
         if cid == ADMIN_ID and msg.content_type == 'document' and cid in admin_waiting_for_upload:
             admin_waiting_for_upload.discard(cid)
             file_info = bot.get_file(msg.document.file_id)
@@ -313,8 +338,9 @@ def all_msgs(msg):
             threading.Thread(target=process_file, args=(path,cid), daemon=True).start()
             return
 
-        # Regular queries
-        stat_set("total_queries", str(int(stat_get("total_queries","0")) + 1))
+        # Normal AI response
+        total_queries = int(stat_get("total_queries","0"))+1
+        stat_set("total_queries",str(total_queries))
         ans = semantic_answer(msg.text)
         bot.send_message(cid, ans)
 
