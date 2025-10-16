@@ -106,7 +106,7 @@ admin_waiting_for_upload = set()
 # EMBEDDINGS (local, small)
 # ---------------------------
 logger.info("Loading embedding model (all-MiniLM-L6-v2)...")
-embed_model = SentenceTransformer('paraphrase-MiniLM-L3-v2')
+embed_model = SentenceTransformer('multi-qa-MiniLM-L6-cos-v1')
 all_chunks = []          # list[str]
 all_embeddings = None    # numpy array shape (n,d) or None
 
@@ -268,17 +268,17 @@ def delete_last_batch():
 # SEMANTIC + GENERATIVE ANSWERING
 # ---------------------------
 def semantic_answer(query, top_k=5):
-    """Return a natural answer. Uses LLM if available; otherwise returns top chunks."""
+    """Return a natural, conversational answer using LLM or fallback to top chunks."""
     if not all_chunks or all_embeddings is None:
-        return "I don’t have any knowledge yet. Ask the admin to upload a dialogue or text."
+        return "I don’t have any knowledge yet. Please ask the admin to upload a dialogue or text."
 
     try:
-        # compute query embedding
+        # Compute query embedding
         q_emb = embed_model.encode([query], convert_to_tensor=False, show_progress_bar=False)
         q_emb = np.asarray(q_emb)[0:1]  # shape (1,d)
-        sims = cosine_similarity(q_emb, all_embeddings)[0]  # shape (n,)
+        sims = cosine_similarity(q_emb, all_embeddings)[0]
         top_idx = sims.argsort()[-top_k:][::-1]
-        selected = [all_chunks[i] for i in top_idx if sims[i] > 0.04]  # threshold slightly lower
+        selected = [all_chunks[i] for i in top_idx if sims[i] > 0.04]
     except Exception:
         logger.exception("Error during semantic retrieval")
         return "Internal retrieval error."
@@ -286,41 +286,47 @@ def semantic_answer(query, top_k=5):
     if not selected:
         return "I couldn’t find anything relevant in my knowledge base."
 
-    # If model not loaded, attempt to load (lazy)
+    # Lazy load model if needed
     if gen_model is None or tokenizer is None:
         loaded = load_gen_model()
         if not loaded:
-            # fallback: return top chunks directly (concise)
             logger.warning("Generative model unavailable; returning top chunks as fallback.")
             return "\n\n".join(selected[:3])
 
-    # Prepare prompt: instruct model to answer naturally and not echo labels
-    context = "\n\n".join(selected[:6])  # feed up to 6 chunks
+    # ✨ Updated natural conversation prompt
+    context = "\n\n".join(selected[:6])
     prompt = (
-        "You are JusticeAI, a concise and helpful assistant. "
-        "Answer the user's question naturally and directly using ONLY the context provided. "
-        "Do NOT repeat the question or include any 'User:' or 'Bot:' labels. If the answer is not "
-        "fully contained in the context, say you don't know and offer to look it up.\n\n"
-        f"CONTEXT:\n{context}\n\nQUESTION:\n{query}\n\nANSWER:"
+        "You are JusticeAI — a friendly, natural, and intelligent assistant. "
+        "Reply conversationally as if chatting with a human. Use only the information in the context below. "
+        "Do NOT mention context, learning, or reasoning. Keep it concise, clear, and human-like.\n\n"
+        f"Context:\n{context}\n\n"
+        f"User: {query}\n"
+        "JusticeAI:"
     )
 
     try:
         inputs = tokenizer(prompt, return_tensors="pt").to(next(gen_model.parameters()).device)
-        outputs = gen_model.generate(**inputs, max_new_tokens=256, do_sample=True, top_p=0.95, temperature=0.2)
+        outputs = gen_model.generate(
+            **inputs,
+            max_new_tokens=256,
+            do_sample=True,
+            top_p=0.9,
+            temperature=0.5
+        )
         text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # The model sometimes echoes the prompt; try to remove prompt prefix if present
-        if prompt.strip() in text:
-            answer = text.split(prompt, 1)[-1].strip()
-        else:
-            # if model returns the full prompt+answer, we keep the trailing portion after "ANSWER:"
-            if "ANSWER:" in text:
-                answer = text.split("ANSWER:", 1)[-1].strip()
-            else:
-                answer = text.strip()
-        # Safety: limit length
+
+        # Clean up output
+        answer = text
+        if "JusticeAI:" in text:
+            answer = text.split("JusticeAI:", 1)[-1].strip()
+        elif "ANSWER:" in text:
+            answer = text.split("ANSWER:", 1)[-1].strip()
+
+        # Trim overly long answers
         if len(answer) > 4000:
             answer = answer[:4000] + "..."
         return answer
+
     except Exception:
         logger.exception("Generation failed; falling back to top chunks")
         return "\n\n".join(selected[:3])
