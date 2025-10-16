@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-JusticeAI - Dialogue-based semantic + generative Telegram assistant
-- Stores Bot responses extracted from "User: ... / Bot: ..." uploads into Postgres chunks
-- Uses sentence-transformers for semantic retrieval
-- Uses Mistral-7B-Instruct via transformers for generation (lazy-loaded)
-- Replies naturally (no "🤔 ..." wrappers, no "User:"/ "Bot:" labels)
-"""
 
 import os
 import time
@@ -143,7 +135,7 @@ except Exception:
 # ---------------------------
 # GENERATIVE MODEL (lazy)
 # ---------------------------
-GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME", "mistralai/Mistral-7B-Instruct-v0.2")
+GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME", "google/flan-t5-small")
 tokenizer = None
 gen_model = None
 model_lock = threading.Lock()
@@ -159,10 +151,8 @@ def load_gen_model():
             tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME, use_fast=True)
             # device_map="auto" requires accelerate installed; may require enough memory
             gen_model = AutoModelForCausalLM.from_pretrained(
-                GEN_MODEL_NAME,
-                device_map="auto",
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True
+               GEN_MODEL_NAME,
+               torch_dtype=torch.float32
             )
             # put model in eval mode
             gen_model.eval()
