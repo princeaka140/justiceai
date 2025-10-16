@@ -106,7 +106,7 @@ admin_waiting_for_upload = set()
 # EMBEDDINGS (local, small)
 # ---------------------------
 logger.info("Loading embedding model (all-MiniLM-L6-v2)...")
-embed_model = SentenceTransformer('all-MiniLM-L6-v2')  # small, fast
+embed_model = SentenceTransformer('paraphrase-MiniLM-L3-v2')
 all_chunks = []          # list[str]
 all_embeddings = None    # numpy array shape (n,d) or None
 
