@@ -1,19 +1,19 @@
 # --- Core ---
-Flask==3.0.3
-gunicorn==23.0.0
+Flask
+gunicorn
 
 # --- Telegram bot ---
-pyTelegramBotAPI==4.21.0
+pyTelegramBotAPI
 
 # --- Database ---
-psycopg2-binary==2.9.9
+psycopg2-binary
 
 # --- AI / NLP ---
-transformers==4.44.2
-torch==2.4.1
-sentence-transformers==3.0.1
-scikit-learn==1.5.2
+transformers
+torch
+sentence-transformers
+scikit-learn
 
 # --- Utility ---
-numpy==1.26.4
-pandas==2.2.3
+numpy
+pandas
