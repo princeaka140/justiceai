@@ -1,4 +1,3 @@
-
 import os
 import time
 import json
@@ -49,25 +48,28 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN not set in env")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7561048693"))
-LIVE_SUPPORT_LINK = "https://t.me/Justiceonsolana1"
+LIVE_SUPPORT_LINK = os.getenv("LIVE_SUPPORT_LINK", "https://t.me/Justiceonsolana1")
 SUPPORT_TIMEOUT = int(os.getenv("SUPPORT_TIMEOUT", 120))
 DB_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", 5000))
+# Optional: set to empty string to disable generation fallback
+GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME", "google/flan-t5-small")
 
 if not DB_URL:
     logger.error("DATABASE_URL not set in env")
 
 # ---------------------------
-# DATABASE CONNECTION (Postgres)
+# DATABASE CONNECTION (Postgres) - DO NOT CHANGE
 # ---------------------------
 conn = psycopg2.connect(DB_URL)
 conn.autocommit = True
 c = conn.cursor()
 
-# Create tables
+# Create tables (chunks stores text entries that we embed & search)
 c.execute('''CREATE TABLE IF NOT EXISTS chunks (
     id SERIAL PRIMARY KEY,
-    text TEXT,
+    text TEXT NOT NULL,
+    kind TEXT,            -- 'user', 'bot', or 'pair'
     batch_id INTEGER,
     added_at TIMESTAMP DEFAULT now()
 )''')
@@ -88,11 +90,13 @@ def stat_set(key, value):
         (str(key), str(value), str(value))
     )
 
-# Initialize basic stats if absent
+# initialize simple stats
 if stat_get("total_users", None) is None:
     stat_set("total_users", "0")
 if stat_get("total_queries", None) is None:
     stat_set("total_queries", "0")
+if stat_get("seen_users", None) is None:
+    stat_set("seen_users", json.dumps({}))
 
 # ---------------------------
 # BOT SETUP
@@ -103,60 +107,63 @@ user_in_support = {}
 admin_waiting_for_upload = set()
 
 # ---------------------------
-# EMBEDDINGS (local, small)
+# EMBEDDINGS (lightweight)
 # ---------------------------
-logger.info("Loading embedding model (all-MiniLM-L6-v2)...")
-embed_model = SentenceTransformer('multi-qa-MiniLM-L6-cos-v1')
-all_chunks = []          # list[str]
-all_embeddings = None    # numpy array shape (n,d) or None
+EMB_MODEL_NAME = os.getenv("EMB_MODEL_NAME", "all-MiniLM-L6-v2")
+logger.info("Loading embedding model (%s)...", EMB_MODEL_NAME)
+embed_model = SentenceTransformer(EMB_MODEL_NAME, device="cpu")
+# global index
+all_chunks = []       # list[str] texts
+all_kinds = []        # list[str] kinds aligned with all_chunks ('user'/'bot'/'pair')
+all_ids = []          # list[int] DB ids aligned
+all_embeddings = None # numpy array (n, d) float16
 
 def rebuild_embeddings():
-    """Reload chunks from DB and compute embeddings (numpy)."""
-    global all_chunks, all_embeddings
+    """Reload chunks from DB and compute embeddings (numpy float16)."""
+    global all_chunks, all_embeddings, all_kinds, all_ids
     logger.info("Rebuilding embeddings from DB...")
-    c.execute("SELECT text FROM chunks ORDER BY id")
+    c.execute("SELECT id, text, kind FROM chunks ORDER BY id")
     rows = c.fetchall()
-    all_chunks = [r[0] for r in rows]
+    all_ids = [r[0] for r in rows]
+    all_chunks = [r[1] for r in rows]
+    all_kinds = [r[2] for r in rows]
     if all_chunks:
-        # compute numpy embeddings (not torch tensors) to keep memory small
+        # compute embeddings as float32 then cast to float16 to save memory
         emb = embed_model.encode(all_chunks, convert_to_tensor=False, show_progress_bar=False)
-        all_embeddings = np.asarray(emb)
-        logger.info("Embeddings rebuilt: %d chunks, emb shape %s", len(all_chunks), all_embeddings.shape)
+        all_embeddings = np.asarray(emb, dtype=np.float16)
+        logger.info("Embeddings rebuilt: %d items, emb shape %s", len(all_chunks), all_embeddings.shape)
     else:
         all_embeddings = None
-        logger.info("No chunks to embed.")
+        logger.info("No chunks found in DB.")
 
-# initial load
 try:
     rebuild_embeddings()
 except Exception:
-    logger.exception("Failed to build initial embeddings")
+    logger.exception("Initial embedding rebuild failed")
 
 # ---------------------------
-# GENERATIVE MODEL (lazy)
+# GENERATIVE MODEL (lazy; optional)
 # ---------------------------
-GEN_MODEL_NAME = os.getenv("GEN_MODEL_NAME", "google/flan-t5-small")
 tokenizer = None
 gen_model = None
 model_lock = threading.Lock()
 
 def load_gen_model():
-    """Lazily load tokenizer and model. Thread-safe."""
+    """Lazily load tokenizer & model if GEN_MODEL_NAME is set and available."""
     global tokenizer, gen_model
+    if not GEN_MODEL_NAME:
+        logger.info("GEN_MODEL_NAME empty -> generation disabled.")
+        return False
     with model_lock:
         if gen_model is not None and tokenizer is not None:
             return True
         try:
-            logger.info("Loading generative model: %s (this may take time)...", GEN_MODEL_NAME)
+            logger.info("Loading generative model: %s", GEN_MODEL_NAME)
             tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_NAME, use_fast=True)
-            # device_map="auto" requires accelerate installed; may require enough memory
-            gen_model = AutoModelForCausalLM.from_pretrained(
-               GEN_MODEL_NAME,
-               torch_dtype=torch.float32
-            )
-            # put model in eval mode
+            # small model recommended (flan-t5-small) to keep memory low; load to CPU
+            gen_model = AutoModelForCausalLM.from_pretrained(GEN_MODEL_NAME, torch_dtype=torch.float32, low_cpu_mem_usage=True)
             gen_model.eval()
-            logger.info("Generative model loaded successfully.")
+            logger.info("Generative model loaded.")
             return True
         except Exception:
             logger.exception("Failed to load generative model")
@@ -176,15 +183,15 @@ def next_batch_id():
     return (val or 0) + 1
 
 def chunk_text(text, max_chars=700):
-    """Split text into char-limited chunks preserving word boundaries."""
     words = text.split()
     chunks = []
-    buf, cur = [], 0
+    buf = []
+    cur = 0
     for w in words:
         if cur + len(w) + 1 > max_chars:
             chunks.append(" ".join(buf))
             buf = buf[-20:]
-            cur = sum(len(x)+1 for x in buf)
+            cur = sum(len(x) + 1 for x in buf)
         buf.append(w)
         cur += len(w) + 1
     if buf:
@@ -205,17 +212,20 @@ def extract_text_from_docx(path):
     return "\n".join(p.text for p in d.paragraphs)
 
 # ---------------------------
-# KNOWLEDGE PARSING (User/Bot dialogues)
+# PARSING DIALOGUE FORMAT
 # ---------------------------
 def parse_dialogue_format(text):
     """
-    Parse a dialogue text in lines containing 'User:' and 'Bot:'.
-    For each Bot: line, pair it with the most recent preceding User: line (if any).
-    Create a chunk '<user sentence> <bot reply>' (without labels).
-    If Bot: appears with no preceding User:, store bot reply alone.
+    Parse text containing 'User:' / 'Bot:' style lines.
+    For each pair (user,b ot) produce three stored pieces:
+      - 'user': the user line (helps paraphrase matching)
+      - 'bot' : the bot reply (helps retrieval if user asks for a phrase from the reply)
+      - 'pair': 'user\nbot' (keeps the combined QA context)
+    If user/bot labels missing, heuristics attempt to alternate.
+    Returns list of tuples (kind, text)
     """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    responses = []
+    entries = []
     last_user = None
     for ln in lines:
         low = ln.lower()
@@ -224,34 +234,41 @@ def parse_dialogue_format(text):
         elif low.startswith("bot:"):
             bot_reply = ln.split(":", 1)[1].strip()
             if last_user:
-                combined = f"{last_user}\n{bot_reply}"
+                entries.append(("user", last_user))
+                entries.append(("bot", bot_reply))
+                entries.append(("pair", last_user + "\n" + bot_reply))
                 last_user = None
             else:
-                combined = bot_reply
-            responses.append(combined)
+                # No preceding user: store bot alone
+                entries.append(("bot", bot_reply))
         else:
-            # If line doesn't have explicit prefix, try to heuristically treat alternating lines:
-            # if previous was user-like (question mark or short phrase), assume it's a user, else bot.
-            if ln.endswith("?") or ln.lower().startswith(("hi","hello","hey","what","who","how","why","when")):
+            # heuristic: treat lines ending with ? or starting with question words as user
+            if ln.endswith("?") or ln.lower().startswith(("who","what","how","why","where","when","do","did","is","are")):
                 last_user = ln
             else:
-                # treat as bot reply
                 if last_user:
-                    combined = f"{last_user}\n{ln}"
+                    entries.append(("user", last_user))
+                    entries.append(("bot", ln))
+                    entries.append(("pair", last_user + "\n" + ln))
                     last_user = None
                 else:
-                    combined = ln
-                responses.append(combined)
-    return responses
+                    # orphan line -> treat as bot reply
+                    entries.append(("bot", ln))
+    return entries
 
 # ---------------------------
-# DB helpers
+# DB helpers (append/delete)
 # ---------------------------
-def append_chunks_to_db(chunks):
+def append_chunks_to_db(chunks_with_kind):
+    """
+    chunks_with_kind: list of tuples (kind, text)
+    inserts into DB and rebuilds embeddings
+    """
     batch = next_batch_id()
-    for t in chunks:
-        c.execute("INSERT INTO chunks(text,batch_id) VALUES (%s,%s)", (t, batch))
-    # Rebuild embeddings after inserting
+    for kind, txt in chunks_with_kind:
+        # store kind to help debugging/analysis
+        c.execute("INSERT INTO chunks(text, kind, batch_id) VALUES (%s,%s,%s)", (txt, kind, batch))
+    # rebuild index
     rebuild_embeddings()
     return batch
 
@@ -265,71 +282,108 @@ def delete_last_batch():
     return last
 
 # ---------------------------
-# SEMANTIC + GENERATIVE ANSWERING
+# SEMANTIC RETRIEVAL + (optional) GENERATION
 # ---------------------------
 def semantic_answer(query, top_k=5):
-    """Return a natural, conversational answer using LLM or fallback to top chunks."""
+    """
+    1) Compute embedding for query
+    2) Retrieve top_k chunks by cosine similarity
+    3) If generative model loaded, ask it to produce a natural answer using top chunks as context
+    4) Otherwise return the best bot chunk or combined pair.
+    """
     if not all_chunks or all_embeddings is None:
         return "I don’t have any knowledge yet. Please ask the admin to upload a dialogue or text."
 
     try:
-        # Compute query embedding
         q_emb = embed_model.encode([query], convert_to_tensor=False, show_progress_bar=False)
-        q_emb = np.asarray(q_emb)[0:1]  # shape (1,d)
-        sims = cosine_similarity(q_emb, all_embeddings)[0]
+        q_emb = np.asarray(q_emb, dtype=np.float16)[0:1]  # shape (1,d)
+        # use float32 for similarity calculation to avoid precision pitfalls
+        sims = cosine_similarity(q_emb.astype(np.float32), all_embeddings.astype(np.float32))[0]
         top_idx = sims.argsort()[-top_k:][::-1]
-        selected = [all_chunks[i] for i in top_idx if sims[i] > 0.04]
+        retrieved = [(i, sims[i], all_kinds[i], all_chunks[i]) for i in top_idx]
     except Exception:
-        logger.exception("Error during semantic retrieval")
+        logger.exception("Retrieval error")
         return "Internal retrieval error."
 
-    if not selected:
-        return "I couldn’t find anything relevant in my knowledge base."
+    # filter by a reasonable threshold (helps avoid false positives on tiny KBs)
+    retrieved = [r for r in retrieved if r[1] >= 0.30]  # tweakable
+    if not retrieved:
+        # if nothing above threshold, return best single item (helpful when KB tiny)
+        best_idx = sims.argsort()[-1]
+        return all_chunks[best_idx]
 
-    # Lazy load model if needed
+    # prefer 'pair' kind or 'bot' kind for direct answers
+    # assemble context from top unique items (prioritize pair then bot then user)
+    seen_texts = set()
+    context_pieces = []
+    for _, score, kind, txt in retrieved:
+        if txt in seen_texts:
+            continue
+        seen_texts.add(txt)
+        # prefer showing bot/pair content in context
+        if kind == "pair":
+            context_pieces.append(txt)
+        elif kind == "bot":
+            context_pieces.append(txt)
+        else:
+            # keep user pieces later
+            context_pieces.append(txt)
+
+    context = "\n\n".join(context_pieces[:4])
+
+    # attempt generation only if model available or if explicitly configured
+    if GEN_MODEL_NAME and (gen_model is None or tokenizer is None):
+        ok = load_gen_model()
+        if not ok:
+            logger.info("Generation model not available; returning best retrieved chunk.")
+            # return the best bot/pair if present
+            for _,_,k,t in retrieved:
+                if k in ("pair","bot"):
+                    return t
+            return retrieved[0][3]
+
     if gen_model is None or tokenizer is None:
-        loaded = load_gen_model()
-        if not loaded:
-            logger.warning("Generative model unavailable; returning top chunks as fallback.")
-            return "\n\n".join(selected[:3])
+        # generation disabled or failed -> return best matching bot/pair or pair text
+        for _,_,k,t in retrieved:
+            if k in ("pair","bot"):
+                return t
+        return retrieved[0][3]
 
-    # ✨ Updated natural conversation prompt
-    context = "\n\n".join(selected[:6])
+    # Build a compact prompt instructing the model to answer naturally without labels.
     prompt = (
-        "You are JusticeAI — a friendly, natural, and intelligent assistant. "
-        "Reply conversationally as if chatting with a human. Use only the information in the context below. "
-        "Do NOT mention context, learning, or reasoning. Keep it concise, clear, and human-like.\n\n"
-        f"Context:\n{context}\n\n"
-        f"User: {query}\n"
-        "JusticeAI:"
+        "You are JusticeAI, a concise friendly assistant. Use ONLY the context below to answer naturally.\n\n"
+        f"Context:\n{context}\n\nUser: {query}\nJusticeAI:"
     )
 
     try:
         inputs = tokenizer(prompt, return_tensors="pt").to(next(gen_model.parameters()).device)
-        outputs = gen_model.generate(
-            **inputs,
-            max_new_tokens=256,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.5
-        )
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # Clean up output
-        answer = text
-        if "JusticeAI:" in text:
-            answer = text.split("JusticeAI:", 1)[-1].strip()
-        elif "ANSWER:" in text:
-            answer = text.split("ANSWER:", 1)[-1].strip()
-
-        # Trim overly long answers
-        if len(answer) > 4000:
-            answer = answer[:4000] + "..."
+        with torch.no_grad():
+            outputs = gen_model.generate(
+                **inputs,
+                max_new_tokens=150,
+                do_sample=True,
+                temperature=0.4,
+                top_p=0.9,
+            )
+        out = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # strip any leading prompt echo
+        if "JusticeAI:" in out:
+            answer = out.split("JusticeAI:", 1)[-1].strip()
+        elif "Answer:" in out:
+            answer = out.split("Answer:", 1)[-1].strip()
+        else:
+            # model might return only the answer fragment
+            answer = out.strip()
+        # safety: keep answer reasonable length
+        if len(answer) > 3000:
+            answer = answer[:3000] + "..."
         return answer
-
     except Exception:
-        logger.exception("Generation failed; falling back to top chunks")
-        return "\n\n".join(selected[:3])
+        logger.exception("Generation failed; fallback to retrieved.")
+        for _,_,k,t in retrieved:
+            if k in ("pair","bot"):
+                return t
+        return retrieved[0][3]
 
 # ---------------------------
 # ADMIN / SUPPORT UI helpers
@@ -373,16 +427,13 @@ def process_file(path, cid):
 
 def process_text(text, cid):
     try:
-        # Parse dialogue "User:" / "Bot:" into combined chunks (user+bot or bot alone)
         parsed = parse_dialogue_format(text)
         if not parsed:
-            bot.send_message(cid, "⚠️ No valid Bot responses found in the file/text. Use 'User:' and 'Bot:' lines.")
+            bot.send_message(cid, "⚠️ No valid Bot responses found. Use lines like 'User: ...' and 'Bot: ...'.")
             return
-        chunks = []
-        for r in parsed:
-            chunks.extend(chunk_text(r))
-        batch = append_chunks_to_db(chunks)
-        bot.send_message(cid, f"✅ Added {len(chunks)} new chunks (batch {batch}). Knowledge updated.")
+        # parsed is list of (kind, text)
+        batch = append_chunks_to_db(parsed)
+        bot.send_message(cid, f"✅ Added {len(parsed)} new items (batch {batch}). Knowledge updated.")
     except Exception:
         logger.exception("Error updating knowledge")
         bot.send_message(cid, "⚠️ Error updating knowledge.")
@@ -393,7 +444,7 @@ def process_text(text, cid):
 @bot.message_handler(commands=['start'])
 def start_cmd(msg):
     cid = msg.chat.id
-    seen = json.loads(stat_get("seen_users", "{}"))
+    seen = json.loads(stat_get("seen_users", "{}") or "{}")
     if str(cid) not in seen:
         seen[str(cid)] = now_str()
         stat_set("seen_users", json.dumps(seen))
@@ -437,7 +488,7 @@ def all_msgs(msg):
         cid = msg.chat.id
         text = (msg.text or "").strip()
 
-        # Live support request
+        # support
         if any(k in text.lower() for k in ["connect me to live support", "talk to human", "support"]):
             bot.send_message(cid, f"🔗 Connect to support: {LIVE_SUPPORT_LINK}")
             bot.send_message(cid, "Say 'continue' or wait for the support timeout to return to AI.")
@@ -454,10 +505,10 @@ def all_msgs(msg):
             bot.send_message(cid, "🕒 You are with live support. Say 'continue' to talk to AI again.")
             return
 
-        # Admin-specific text commands
+        # admin commands
         if cid == ADMIN_ID:
-            txt_lower = text.lower()
-            if txt_lower == "🩺 bot health":
+            tl = text.lower()
+            if tl == "🩺 bot health":
                 uptime = int(time.time() - START_TIME)
                 reply = (
                     f"🩺 Uptime: {uptime}s\n"
@@ -468,26 +519,26 @@ def all_msgs(msg):
                 )
                 bot.send_message(cid, reply)
                 return
-            if txt_lower == "📘 update knowledge":
+            if tl == "📘 update knowledge":
                 admin_waiting_for_upload.add(cid)
                 bot.send_message(cid, "📄 Send a .txt/.pdf/.docx file or paste dialogue text to add knowledge.")
                 return
-            if txt_lower == "📊 stats":
+            if tl == "📊 stats":
                 total_users = stat_get("total_users")
                 total_queries = stat_get("total_queries")
-                seen = json.loads(stat_get("seen_users","{}"))
+                seen = json.loads(stat_get("seen_users","{}") or "{}")
                 last5 = list(seen.items())[-5:]
                 txt = "\n".join([f"{u} @ {t}" for u,t in last5])
                 bot.send_message(cid, f"📊 Stats:\nUsers: {total_users}\nQueries: {total_queries}\nLast 5:\n{txt}")
                 return
 
-        # Admin upload as plain text
+        # admin upload as text
         if cid in admin_waiting_for_upload and msg.content_type == 'text':
             admin_waiting_for_upload.discard(cid)
             threading.Thread(target=process_text, args=(msg.text,cid), daemon=True).start()
             return
 
-        # Admin upload as document
+        # admin upload as document
         if cid == ADMIN_ID and msg.content_type == 'document' and cid in admin_waiting_for_upload:
             admin_waiting_for_upload.discard(cid)
             file_info = bot.get_file(msg.document.file_id)
@@ -498,10 +549,10 @@ def all_msgs(msg):
             threading.Thread(target=process_file, args=(path,cid), daemon=True).start()
             return
 
-        # Normal user query
+        # normal user query
         stat_set("total_queries", str(int(stat_get("total_queries", "0")) + 1))
-        answer = semantic_answer(text)
-        bot.send_message(cid, answer)
+        ans = semantic_answer(text)
+        bot.send_message(cid, ans)
 
     except Exception:
         logger.exception("Error processing message")
@@ -513,7 +564,7 @@ def all_msgs(msg):
 # ---------------------------
 # RUN LOOP
 # ---------------------------
-logger.info("🚀 JusticeAI (Deep, lazy-gen) starting. Port=%s", PORT)
+logger.info("🚀 JusticeAI starting on port %s", PORT)
 while True:
     try:
         bot.polling(non_stop=True, timeout=60, long_polling_timeout=60)
