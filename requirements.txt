@@ -1,19 +1,7 @@
-# --- Core ---
-Flask
-gunicorn
-
-# --- Telegram bot ---
 pyTelegramBotAPI
-
-# --- Database ---
 psycopg2-binary
-
-# --- AI / NLP ---
-transformers
+sentence-transformers==3.0.1
 torch
-sentence-transformers
-scikit-learn
-
-# --- Utility ---
-numpy
-pandas
+python-dotenv
+PyPDF2
+python-docx
