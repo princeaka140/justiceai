@@ -15,7 +15,7 @@ from docx import Document
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 
 bot = TeleBot(BOT_TOKEN)
